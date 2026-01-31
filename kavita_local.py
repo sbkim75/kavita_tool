@@ -2,22 +2,65 @@ import argparse
 import os
 import sys
 from pathlib import Path
+import yaml
+
+from mod_makeinfo import ModMakeInfo
+from site_naver_book import SiteNaverBook
+from tool import get_logger
 
 # 지원하는 전자책 파일 확장자
 EXTENSIONS = ["cbz", "zip", "rar", "cbr", "tar.gz", "7zip", "7z", "cb7", "cbt", "pdf", "epub", "txt"]
 
+logger = get_logger()
+
 class KavitaLocal:
-    def __init__(self, root_path=None, recursive=True):
+    def __init__(self, root_path=None, recursive=True, config_path=None, option_name=None):
         """
-        Windows 환경에서 로컬 디렉토리의 책을 검색하는 클래스
+        Windows 환경에서 로컬 디렉토리의 책을 검색하고 메타 정보를 생성하는 클래스
 
         Args:
             root_path: 검색할 경로 (기본값: 현재 디렉토리)
             recursive: 하위 디렉토리 포함 여부 (기본값: True)
+            config_path: config.yaml 파일 경로 (기본값: 현재 디렉토리의 config.yaml)
+            option_name: 사용할 옵션 이름 (기본값: 첫 번째 옵션)
         """
         self.root_path = Path(root_path) if root_path else Path.cwd()
         self.recursive = recursive
         self.books = []
+
+        # config.yaml 로드
+        if config_path is None:
+            config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'config.yaml')
+
+        self.config = None
+        self.option = None
+        if os.path.exists(config_path):
+            with open(config_path, encoding='utf8') as file:
+                self.config = yaml.load(file, Loader=yaml.FullLoader)
+
+            # 옵션 선택 (ROOT는 무시하고 현재 디렉토리 사용)
+            if option_name:
+                for opt in self.config.get('OPTIONS', []):
+                    if str(opt['NAME']) == option_name:
+                        self.option = opt
+                        break
+
+            if self.option is None and self.config.get('OPTIONS'):
+                self.option = self.config.get('OPTIONS')[0]
+
+            if self.option:
+                # ROOT를 현재 디렉토리로 덮어쓰기
+                self.option['ROOT'] = str(self.root_path)
+
+                # NAVER API 키 설정
+                SiteNaverBook.apikey = self.config.get('NAVER_APIKEY', [])
+
+                # META_GENRE 기본값 설정
+                if 'META_GENRE' not in self.option:
+                    self.option['META_GENRE'] = ""
+        else:
+            logger.warning(f"config.yaml 파일을 찾을 수 없습니다: {config_path}")
+            logger.warning("메타 정보 생성 없이 검색만 수행합니다.")
 
     def is_book_file(self, filename):
         """파일이 전자책 파일인지 확인"""
@@ -58,6 +101,43 @@ class KavitaLocal:
                     self.add_book(str(item), item.name, str(self.root_path))
 
         self.display_results()
+
+    def create_metadata(self):
+        """검색된 디렉토리에 대해 메타 정보 생성"""
+        if not self.option:
+            logger.error("설정 파일이 로드되지 않아 메타 정보를 생성할 수 없습니다.")
+            return
+
+        if not self.books:
+            logger.warning("검색된 책 파일이 없습니다.")
+            return
+
+        # 디렉토리별로 그룹화
+        books_by_dir = {}
+        for book in self.books:
+            dir_path = book['directory']
+            if dir_path not in books_by_dir:
+                books_by_dir[dir_path] = []
+            books_by_dir[dir_path].append(book)
+
+        logger.info(f"\n메타 정보 생성을 시작합니다...")
+        logger.info(f"총 {len(books_by_dir)}개의 디렉토리에 대해 처리합니다.\n")
+
+        # ModMakeInfo 인스턴스 생성
+        mod_makeinfo = ModMakeInfo(self.option)
+
+        # 각 디렉토리에 대해 메타 정보 생성
+        for idx, directory in enumerate(sorted(books_by_dir.keys()), 1):
+            logger.info(f"[{idx}/{len(books_by_dir)}] 처리 중: {directory}")
+            try:
+                kavita_info_path = os.path.join(directory, 'kavita.yaml')
+                mod_makeinfo.makeinfo_folder(directory, kavita_info_path)
+                logger.info(f"✅ 완료: {directory}\n")
+            except Exception as e:
+                logger.error(f"❌ 실패: {directory}")
+                logger.error(f"에러: {str(e)}\n")
+
+        logger.info("메타 정보 생성이 완료되었습니다.")
 
     def add_book(self, filepath, filename, directory):
         """책 정보를 리스트에 추가"""
@@ -162,7 +242,7 @@ class KavitaLocal:
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Windows 환경에서 현재 디렉토리의 전자책 파일을 검색합니다.',
+        description='Windows 환경에서 현재 디렉토리의 전자책 파일을 검색하고 메타 정보를 생성합니다.',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 사용 예시:
@@ -174,6 +254,12 @@ def main():
 
   # 현재 디렉토리만 검색 (하위 폴더 제외)
   python kavita_local.py --no-recursive
+
+  # 검색 후 메타 정보 생성
+  python kavita_local.py --make-info
+
+  # 특정 설정 옵션으로 메타 정보 생성
+  python kavita_local.py --make-info --option RIDI
 
   # 검색 결과를 파일로 저장
   python kavita_local.py --export books.txt
@@ -197,6 +283,26 @@ def main():
     )
 
     parser.add_argument(
+        '--make-info',
+        action='store_true',
+        help='kavita.yaml 메타 정보 파일 생성'
+    )
+
+    parser.add_argument(
+        '--config',
+        type=str,
+        default=None,
+        help='config.yaml 파일 경로 (기본값: 스크립트와 같은 디렉토리)'
+    )
+
+    parser.add_argument(
+        '--option',
+        type=str,
+        default=None,
+        help='사용할 설정 옵션 이름 (예: RIDI, TEXT 등)'
+    )
+
+    parser.add_argument(
         '--export',
         type=str,
         default=None,
@@ -210,11 +316,17 @@ def main():
         # KavitaLocal 인스턴스 생성
         kavita = KavitaLocal(
             root_path=args.path,
-            recursive=not args.no_recursive
+            recursive=not args.no_recursive,
+            config_path=args.config,
+            option_name=args.option
         )
 
         # 책 검색
         kavita.search_books()
+
+        # 메타 정보 생성 (옵션)
+        if args.make_info:
+            kavita.create_metadata()
 
         # 결과 저장 (옵션)
         if args.export:
